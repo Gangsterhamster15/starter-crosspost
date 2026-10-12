@@ -27,6 +27,7 @@ ADMIN_IDS = {
     for x in os.environ.get("TG_ADMIN_IDS", "").replace(";", ",").split(",")
     if x.strip().lstrip("-").isdigit()
 }
+ADMIN_HINTS = set()  # чаты админов, которым нужно ответить подсказкой
 
 SETTLE_SECONDS = 90  # ждём, пока долетят все части альбома
 TG_LIMIT_BYTES = 20 * 1024 * 1024  # лимит скачивания файлов через Bot API
@@ -67,18 +68,27 @@ def collect_posts(updates):
         reply_to = None
         if m:
             if TG_CHANNEL_ID and str(m["chat"]["id"]) != TG_CHANNEL_ID:
+                print("Пост другого канала, пропускаю (не совпадает TG_CHANNEL_ID)")
                 continue
+            print(f"Получен пост канала {m['message_id']}")
             src_chat, src_msg_id = m["chat"], m["message_id"]
         else:
             # личное сообщение боту: берём только пересылки от админов
             m = u.get("message")
             if not m or m["chat"].get("type") != "private":
+                kinds = [k for k in u if k != "update_id"]
+                print(f"Обновление типа {kinds} пропущено: это не пост канала и не личное сообщение")
                 continue
             if m.get("from", {}).get("id") not in ADMIN_IDS:
+                print("Личное сообщение от отправителя, которого нет в TG_ADMIN_IDS, пропускаю"
+                      + ("" if ADMIN_IDS else " (список TG_ADMIN_IDS пуст)"))
                 continue
             origin = m.get("forward_origin")
             if not origin:
+                print("Сообщение от админа пришло не как пересылка поста, пропускаю")
+                ADMIN_HINTS.add(m["chat"]["id"])
                 continue
+            print(f"Получена пересылка от админа (сообщение {m['message_id']})")
             reply_to = m["chat"]["id"]
             if origin.get("type") == "channel":
                 src_chat, src_msg_id = origin["chat"], origin["message_id"]
@@ -485,7 +495,9 @@ def main():
         print("Новых постов нет")
         return
 
+    print(f"Получено обновлений: {len(updates)}")
     posts = collect_posts(updates)
+    print(f"Постов к публикации: {len(posts)}")
     confirm_to = updates[-1]["update_id"]
     failed = False
 
@@ -504,6 +516,14 @@ def main():
         notify(p, ok)
 
     if not DRY_RUN:
+        for chat_id in ADMIN_HINTS:
+            try:
+                tg("sendMessage", chat_id=chat_id, text=(
+                    "Это сообщение не опубликовано: нужна именно пересылка поста из канала. "
+                    "При пересылке не выбирайте «Скрыть автора» и «Копировать»."
+                ))
+            except Exception as e:  # noqa: BLE001
+                print(f"Не удалось ответить в личку: {e}")
         # подтверждаем обработанное, чтобы не публиковать повторно
         tg("getUpdates", offset=confirm_to + 1, limit=1, timeout=0)
     sys.exit(1 if failed else 0)

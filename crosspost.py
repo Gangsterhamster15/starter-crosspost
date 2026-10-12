@@ -5,9 +5,11 @@
 Telegram держит неподтверждённые обновления до 24 часов, а мы подтверждаем
 их только после обработки.
 """
+import glob
 import html
 import os
 import re
+import ssl
 import sys
 import tempfile
 import time
@@ -36,7 +38,7 @@ VK_API_VERSION = "5.199"
 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 TG_FILE = f"https://api.telegram.org/file/bot{TG_TOKEN}"
-MAX_API = "https://platform-api.max.ru"
+MAX_API = os.environ.get("MAX_API_URL", "https://platform-api2.max.ru").rstrip("/")
 
 
 # ───────────────────────── Telegram ─────────────────────────
@@ -326,23 +328,73 @@ def vk_upload_video(path, name):
     return f"video{r['owner_id']}_{r['video_id']}"
 
 
-def post_vk(text, media):
-    atts = []
+def with_note(text, note, signature):
+    """Вставляет заметку перед подписью (или в конец, если подписи нет)."""
+    if text.endswith(signature):
+        return text[: -len(signature)].rstrip() + "\n\n" + note + "\n\n" + signature
+    return text + "\n\n" + note
+
+
+def post_vk(text, media, link=None):
+    """Публикует пост. Возвращает число файлов, которые не удалось загрузить."""
+    atts, failed = [], 0
     title = (text.strip().splitlines() or [""])[0]
     for item in media:
-        if item["kind"] == "photo":
-            atts.append(vk_upload_photo(item["path"]))
-        else:
-            atts.append(vk_upload_video(item["path"], title))
+        try:
+            if item["kind"] == "photo":
+                atts.append(vk_upload_photo(item["path"]))
+            else:
+                atts.append(vk_upload_video(item["path"], title))
+        except Exception as e:  # noqa: BLE001
+            failed += 1
+            print(f"  VK: не удалось загрузить {item['kind']}: {e}")
+    if failed and link:
+        text = with_note(text, f"Полная версия в Telegram: {link}", SIGNATURE_VK)
     vk("wall.post", owner_id=-int(VK_GROUP_ID), from_group=1,
        message=text, attachments=",".join(atts[:10]))
+    return failed
 
 
 # ───────────────────────────── MAX ─────────────────────────────
 
+_max_verify = None
+
+
+def max_verify():
+    """Сертификаты для HTTPS-запросов к MAX.
+
+    API MAX требует доверять сертификату Минцифры. Положите скачанные
+    сертификаты в корень репозитория с именами russian_trusted_* (любое
+    расширение), и скрипт добавит их к обычным.
+    """
+    global _max_verify
+    if _max_verify is not None:
+        return _max_verify
+    files = sorted(glob.glob("russian_trusted_*"))
+    if not files:
+        _max_verify = True
+        return True
+    import certifi
+
+    pems = []
+    for name in files:
+        with open(name, "rb") as f:
+            raw = f.read()
+        if b"BEGIN CERTIFICATE" in raw:
+            pems.append(raw.decode("ascii", errors="ignore"))
+        else:  # сертификат в бинарном формате DER
+            pems.append(ssl.DER_cert_to_PEM_cert(raw))
+    path = os.path.join(tempfile.gettempdir(), "max_ca_bundle.pem")
+    with open(certifi.where(), encoding="utf-8") as base, open(path, "w", encoding="utf-8") as out:
+        out.write(base.read() + "\n" + "\n".join(pems))
+    print(f"MAX: добавлено сертификатов из файлов: {len(files)}")
+    _max_verify = path
+    return path
+
+
 def max_req(method, path, **kw):
-    return requests.request(method, MAX_API + path,
-                            headers={"Authorization": MAX_TOKEN}, timeout=120, **kw)
+    return requests.request(method, MAX_API + path, headers={"Authorization": MAX_TOKEN},
+                            timeout=120, verify=max_verify(), **kw)
 
 
 def max_upload(path, kind):
@@ -350,26 +402,70 @@ def max_upload(path, kind):
     r.raise_for_status()
     info = r.json()
     with open(path, "rb") as f:
-        up = requests.post(info["url"], files={"data": f}, timeout=900)
+        up = requests.post(info["url"], files={"data": f}, timeout=900, verify=max_verify())
     up.raise_for_status()
-    token = info.get("token")
+    token = None
+    if kind == "image":  # для картинок токен приходит в ответе на загрузку файла
+        try:
+            token = next(iter(up.json()["photos"].values()))["token"]
+        except Exception:  # noqa: BLE001
+            token = None
+    token = token or info.get("token")
     if not token:
-        data = up.json()
-        token = next(iter(data["photos"].values()))["token"]
+        raise RuntimeError("MAX: не получен токен загруженного файла")
     return {"type": "image" if kind == "image" else "video", "payload": {"token": token}}
 
 
-def post_max(text_html, media):
-    atts = [max_upload(m["path"], "image" if m["kind"] == "photo" else "video") for m in media]
+def find_max_chat():
+    """Показывает chat_id чатов и каналов из последних событий бота MAX."""
+    r = max_req("GET", "/updates", params={"limit": 100, "timeout": 5})
+    print(f"MAX /updates: HTTP {r.status_code}")
+    if not r.ok:
+        print(r.text[:500])
+        return
+    found = {}
+
+    def walk(obj, utype):
+        if isinstance(obj, dict):
+            cid = obj.get("chat_id")
+            if isinstance(cid, (int, str)):
+                found.setdefault(str(cid), set()).add(utype)
+            for v in obj.values():
+                walk(v, utype)
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v, utype)
+
+    for u in r.json().get("updates", []):
+        walk(u, u.get("update_type", "?"))
+    if not found:
+        print("Событий нет. Добавьте бота в канал администратором (или удалите и добавьте заново) "
+              "и сразу запустите этот режим ещё раз.")
+    for cid, types in found.items():
+        print(f"chat_id: {cid}  (события: {', '.join(sorted(types))})")
+
+
+def post_max(text_html, media, link=None):
+    """Публикует пост. Возвращает число файлов, которые не удалось загрузить."""
+    atts, failed = [], 0
+    for m in media:
+        try:
+            atts.append(max_upload(m["path"], "image" if m["kind"] == "photo" else "video"))
+        except Exception as e:  # noqa: BLE001
+            failed += 1
+            print(f"  MAX: не удалось загрузить {m['kind']}: {e}")
+    if failed and link:
+        note = html.escape(f"Полная версия в Telegram: {link}", quote=False)
+        text_html = with_note(text_html, note, SIGNATURE_MAX)
     body = {"text": text_html, "format": "html"}
     if atts:
         body["attachments"] = atts
-    for _ in range(12):
+    for _ in range(36):  # видео обрабатывается дольше, ждём до ~3 минут
         r = max_req("POST", "/messages", params={"chat_id": MAX_CHAT_ID}, json=body)
         if r.ok:
-            return
+            return failed
         if "not.ready" in r.text:  # видео/картинка ещё обрабатываются
-            time.sleep(4)
+            time.sleep(5)
             continue
         raise RuntimeError(f"MAX {r.status_code}: {r.text[:300]}")
     raise RuntimeError("MAX: вложение так и не обработалось")
@@ -457,15 +553,23 @@ def process(p):
 
         if VK_TOKEN and VK_GROUP_ID:
             try:
-                post_vk(vk_text, media)
-                print("  VK: ок")
+                bad = post_vk(vk_text, media, link)
+                if bad:
+                    ok = False
+                    print(f"  VK: опубликовано без {bad} файл(ов), см. ошибку выше")
+                else:
+                    print("  VK: ок")
             except Exception as e:  # noqa: BLE001
                 ok = False
                 print(f"  VK: ОШИБКА {e}")
         if MAX_TOKEN and MAX_CHAT_ID:
             try:
-                post_max(max_html, media)
-                print("  MAX: ок")
+                bad = post_max(max_html, media, link)
+                if bad:
+                    ok = False
+                    print(f"  MAX: опубликовано без {bad} файл(ов), см. ошибку выше")
+                else:
+                    print("  MAX: ок")
             except Exception as e:  # noqa: BLE001
                 ok = False
                 print(f"  MAX: ОШИБКА {e}")
@@ -488,6 +592,9 @@ def notify(p, ok):
 
 
 def main():
+    if os.environ.get("FIND_MAX_CHAT") == "1":
+        find_max_chat()
+        return
     if not TG_TOKEN:
         sys.exit("Не задан TG_BOT_TOKEN")
     updates = tg("getUpdates", timeout=0, limit=100, allowed_updates=["channel_post", "message"])

@@ -10,6 +10,7 @@ import html
 import mimetypes
 import os
 import re
+import secrets
 import ssl
 import sys
 import tempfile
@@ -21,6 +22,13 @@ TG_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHANNEL_ID = os.environ.get("TG_CHANNEL_ID", "").strip()  # необязательно, например -1001234567890
 VK_TOKEN = os.environ.get("VK_TOKEN", "")
 VK_GROUP_ID = os.environ.get("VK_GROUP_ID", "").strip().lstrip("-")
+# VK ID (токен пользователя для фото и видео)
+VK_APP_ID = os.environ.get("VK_APP_ID", "").strip()
+VK_REDIRECT_URI = os.environ.get("VK_REDIRECT_URI", "").strip()
+VK_REFRESH_TOKEN = os.environ.get("VK_REFRESH_TOKEN", "").strip()
+VK_DEVICE_ID = os.environ.get("VK_DEVICE_ID", "").strip()
+VK_CODE_VERIFIER = os.environ.get("VK_CODE_VERIFIER", "").strip()
+GH_PAT = os.environ.get("GH_PAT", "").strip()
 MAX_TOKEN = os.environ.get("MAX_TOKEN", "")
 MAX_CHAT_ID = os.environ.get("MAX_CHAT_ID", "").strip()
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
@@ -306,8 +314,104 @@ def to_vk_text(text, entities):
 
 # ───────────────────────────── VK ─────────────────────────────
 
+VK_ID_URL = "https://id.vk.com/oauth2/auth"
+_vk_user_token = None
+
+
+def mask(value):
+    """Скрывает значение в логах GitHub Actions."""
+    if value and os.environ.get("GITHUB_ACTIONS"):
+        print(f"::add-mask::{value}")
+
+
+def save_secret(name, value):
+    """Сохраняет значение в секрет репозитория (нужен секрет GH_PAT)."""
+    import subprocess
+
+    if not GH_PAT:
+        raise RuntimeError("не задан секрет GH_PAT, не могу сохранить " + name)
+    subprocess.run(
+        ["gh", "secret", "set", name, "--repo", os.environ["GITHUB_REPOSITORY"]],
+        input=value.encode(), check=True, capture_output=True,
+        env=dict(os.environ, GH_TOKEN=GH_PAT),
+    )
+
+
+def vk_id_request(data):
+    r = requests.post(VK_ID_URL, data=data, timeout=60)
+    try:
+        d = r.json()
+    except ValueError:
+        raise RuntimeError(f"VK ID: HTTP {r.status_code} {r.text[:300]}")
+    if "error" in d or "access_token" not in d:
+        raise RuntimeError(f"VK ID: {d.get('error')}: {d.get('error_description') or d}")
+    for k in ("access_token", "refresh_token", "id_token"):
+        mask(d.get(k))
+    return d
+
+
+def vk_token():
+    """Токен для VK API: токен пользователя через VK ID, если он настроен, иначе ключ сообщества."""
+    global _vk_user_token
+    if not VK_REFRESH_TOKEN:
+        return VK_TOKEN
+    if _vk_user_token:
+        return _vk_user_token
+    d = vk_id_request({
+        "grant_type": "refresh_token",
+        "refresh_token": VK_REFRESH_TOKEN,
+        "client_id": VK_APP_ID,
+        "device_id": VK_DEVICE_ID,
+        "state": secrets.token_urlsafe(24),
+    })
+    new_refresh = d.get("refresh_token")
+    if new_refresh and new_refresh != VK_REFRESH_TOKEN:
+        save_secret("VK_REFRESH_TOKEN", new_refresh)  # VK выдаёт новый refresh-токен взамен старого
+    _vk_user_token = d["access_token"]
+    print("VK: токен пользователя обновлён")
+    return _vk_user_token
+
+
+def vk_auth(url):
+    """Одноразовый обмен кода из ссылки VK ID на токены."""
+    from urllib.parse import parse_qs, urlparse
+
+    q = {k: v[0] for k, v in parse_qs(urlparse(url.strip()).query).items()}
+    if "payload" in q:  # иногда VK присылает данные одним JSON-параметром
+        import json
+        q.update(json.loads(q["payload"]))
+    code, device_id = q.get("code"), q.get("device_id")
+    if not code or not device_id:
+        sys.exit("В ссылке нет code или device_id. Скопируйте адрес целиком из адресной строки.")
+    mask(code)
+    if not VK_CODE_VERIFIER:
+        sys.exit("Не задан секрет VK_CODE_VERIFIER")
+    d = vk_id_request({
+        "grant_type": "authorization_code",
+        "code": code,
+        "code_verifier": VK_CODE_VERIFIER,
+        "client_id": VK_APP_ID,
+        "device_id": device_id,
+        "redirect_uri": VK_REDIRECT_URI,
+        "state": q.get("state", ""),
+    })
+    print(f"VK ID: вход выполнен, пользователь {d.get('user_id')}")
+    print(f"Выданные доступы: {d.get('scope')}")
+    save_secret("VK_REFRESH_TOKEN", d["refresh_token"])
+    save_secret("VK_DEVICE_ID", device_id)
+    print("Секреты VK_REFRESH_TOKEN и VK_DEVICE_ID сохранены.")
+    global _vk_user_token
+    _vk_user_token = d["access_token"]
+    try:
+        g = vk("groups.getById", group_id=vk_group_id(), fields="is_admin")
+        g = g.get("groups", g) if isinstance(g, dict) else g
+        print(f"Сообщество: «{g[0].get('name')}», вы администратор: {bool(g[0].get('is_admin'))}")
+    except Exception as e:  # noqa: BLE001
+        print(f"Не удалось проверить сообщество: {e}")
+
+
 def vk(method, **params):
-    params.update(access_token=VK_TOKEN, v=VK_API_VERSION)
+    params.update(access_token=vk_token(), v=VK_API_VERSION)
     r = requests.post(f"https://api.vk.com/method/{method}", data=params, timeout=120)
     d = r.json()
     if "error" in d:
@@ -623,7 +727,7 @@ def process(p):
     link = post_link(p["chat"], p["message_id"])
     results = {}
     platforms = []
-    if VK_TOKEN and VK_GROUP_ID:
+    if (VK_TOKEN or VK_REFRESH_TOKEN) and VK_GROUP_ID:
         platforms.append("VK")
     if MAX_TOKEN and MAX_CHAT_ID:
         platforms.append("MAX")
@@ -689,6 +793,9 @@ def notify(p, results):
 
 
 def main():
+    if os.environ.get("VK_AUTH_URL", "").strip():
+        vk_auth(os.environ["VK_AUTH_URL"])
+        return
     if os.environ.get("CHECK_MAX") == "1":
         check_max_chat()
         return

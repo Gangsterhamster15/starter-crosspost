@@ -314,17 +314,37 @@ def vk(method, **params):
     return d["response"]
 
 
+_vk_gid = None
+
+
+def vk_group_id():
+    """Числовой id сообщества. Понимает 123, -123, club123, public123, ссылку и короткое имя."""
+    global _vk_gid
+    if _vk_gid:
+        return _vk_gid
+    raw = VK_GROUP_ID.strip().rstrip("/").split("/")[-1].lstrip("-")
+    m = re.fullmatch(r"(?:club|public|event)?(\d+)", raw)
+    if m:
+        _vk_gid = m.group(1)
+    else:
+        res = vk("groups.getById", group_id=raw)
+        groups = res.get("groups", res) if isinstance(res, dict) else res
+        _vk_gid = str(groups[0]["id"])
+        print(f"VK: короткое имя сообщества преобразовано в числовой id {_vk_gid}")
+    return _vk_gid
+
+
 def vk_upload_photo(path):
-    srv = vk("photos.getWallUploadServer", group_id=VK_GROUP_ID)
+    srv = vk("photos.getWallUploadServer", group_id=vk_group_id())
     with open(path, "rb") as f:
         up = requests.post(srv["upload_url"], files={"photo": f}, timeout=300).json()
-    saved = vk("photos.saveWallPhoto", group_id=VK_GROUP_ID,
+    saved = vk("photos.saveWallPhoto", group_id=vk_group_id(),
                server=up["server"], photo=up["photo"], hash=up["hash"])
     return f"photo{saved[0]['owner_id']}_{saved[0]['id']}"
 
 
 def vk_upload_video(path, name):
-    r = vk("video.save", group_id=VK_GROUP_ID, name=name[:100] or "Видео", wallpost=0)
+    r = vk("video.save", group_id=vk_group_id(), name=name[:100] or "Видео", wallpost=0)
     with open(path, "rb") as f:
         requests.post(r["upload_url"], files={"video_file": f}, timeout=900).raise_for_status()
     return f"video{r['owner_id']}_{r['video_id']}"
@@ -352,7 +372,7 @@ def post_vk(text, media, link=None):
             print(f"  VK: не удалось загрузить {item['kind']}: {e}")
     if failed and ADD_TG_LINK and link:
         text = with_note(text, f"Полная версия в Telegram: {link}", SIGNATURE_VK)
-    vk("wall.post", owner_id=-int(VK_GROUP_ID), from_group=1,
+    vk("wall.post", owner_id=-int(vk_group_id()), from_group=1,
        message=text, attachments=",".join(atts[:10]))
     return failed
 
@@ -411,8 +431,9 @@ def max_upload(path, kind):
     r.raise_for_status()
     info = r.json()
     with open(path, "rb") as f:
+        # как в официальном клиенте MAX: multipart, поле data, без заголовка авторизации
         up = requests.post(info["url"], files={"data": (os.path.basename(path), f)},
-                           headers={"Authorization": MAX_TOKEN}, timeout=900, verify=max_verify())
+                           timeout=900, verify=max_verify())
     if not up.ok:
         raise RuntimeError(f"загрузка файла: HTTP {up.status_code} {up.text[:300]}")
     try:

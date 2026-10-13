@@ -29,7 +29,9 @@ ADMIN_IDS = {
     for x in os.environ.get("TG_ADMIN_IDS", "").replace(";", ",").split(",")
     if x.strip().lstrip("-").isdigit()
 }
-ADMIN_HINTS = set()  # чаты админов, которым нужно ответить подсказкой
+ADMIN_HINTS = set()
+# Добавлять ли ссылку «Полная версия в Telegram», если какой-то файл не перенёсся
+ADD_TG_LINK = os.environ.get("ADD_TG_LINK") == "1"  # чаты админов, которым нужно ответить подсказкой
 
 SETTLE_SECONDS = 90  # ждём, пока долетят все части альбома
 TG_LIMIT_BYTES = 20 * 1024 * 1024  # лимит скачивания файлов через Bot API
@@ -348,7 +350,7 @@ def post_vk(text, media, link=None):
         except Exception as e:  # noqa: BLE001
             failed += 1
             print(f"  VK: не удалось загрузить {item['kind']}: {e}")
-    if failed and link:
+    if failed and ADD_TG_LINK and link:
         text = with_note(text, f"Полная версия в Telegram: {link}", SIGNATURE_VK)
     vk("wall.post", owner_id=-int(VK_GROUP_ID), from_group=1,
        message=text, attachments=",".join(atts[:10]))
@@ -409,17 +411,24 @@ def max_upload(path, kind):
     r.raise_for_status()
     info = r.json()
     with open(path, "rb") as f:
-        up = requests.post(info["url"], files={"data": f}, timeout=900, verify=max_verify())
-    up.raise_for_status()
+        up = requests.post(info["url"], files={"data": (os.path.basename(path), f)},
+                           headers={"Authorization": MAX_TOKEN}, timeout=900, verify=max_verify())
+    if not up.ok:
+        raise RuntimeError(f"загрузка файла: HTTP {up.status_code} {up.text[:300]}")
+    try:
+        data = up.json()
+    except ValueError:
+        data = {}
     token = None
     if kind == "image":  # для картинок токен приходит в ответе на загрузку файла
         try:
-            token = next(iter(up.json()["photos"].values()))["token"]
+            token = next(iter(data["photos"].values()))["token"]
         except Exception:  # noqa: BLE001
             token = None
-    token = token or info.get("token")
+    token = token or info.get("token") or (data.get("token") if isinstance(data, dict) else None)
     if not token:
-        raise RuntimeError("MAX: не получен токен загруженного файла")
+        raise RuntimeError(f"не получен токен файла. Ответ /uploads: {str(info)[:200]}; "
+                           f"ответ загрузки: {up.text[:200]}")
     return {"type": "image" if kind == "image" else "video", "payload": {"token": token}}
 
 
@@ -498,7 +507,7 @@ def post_max(text_html, media, link=None):
         except Exception as e:  # noqa: BLE001
             failed += 1
             print(f"  MAX: не удалось загрузить {m['kind']}: {e}")
-    if failed and link:
+    if failed and ADD_TG_LINK and link:
         note = html.escape(f"Полная версия в Telegram: {link}", quote=False)
         text_html = with_note(text_html, note, SIGNATURE_MAX)
     body = {"text": text_html, "format": "html"}
@@ -581,7 +590,9 @@ def process(p):
                     raise
 
         note = ""
-        if too_big and link:
+        if too_big:
+            print("  Видео больше 20 МБ: Telegram не отдаёт его боту, публикую без него")
+        if too_big and ADD_TG_LINK and link:
             note = f"\n\nПолная версия с видео: {link}"
 
         vk_text, max_html, empty = compose_texts(p["text"], p["entities"], note, link)

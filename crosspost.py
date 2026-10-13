@@ -416,6 +416,38 @@ def max_upload(path, kind):
     return {"type": "image" if kind == "image" else "video", "payload": {"token": token}}
 
 
+def check_max_chat():
+    """Безопасная проверка MAX_CHAT_ID: только читает данные о канале, события бота не трогает."""
+    if not MAX_TOKEN:
+        print("Не задан секрет MAX_TOKEN")
+        return
+    me = max_req("GET", "/me")
+    print(f"MAX /me: HTTP {me.status_code}")
+    if me.ok:
+        b = me.json()
+        print(f"Бот: {b.get('name') or b.get('first_name')} (@{b.get('username')}), id {b.get('user_id')}")
+    else:
+        print(me.text[:300])
+        return
+    if not MAX_CHAT_ID:
+        print("Не задан секрет MAX_CHAT_ID: токен рабочий, осталось указать id канала")
+        return
+    ch = max_req("GET", f"/chats/{MAX_CHAT_ID}")
+    print(f"MAX /chats/{MAX_CHAT_ID}: HTTP {ch.status_code}")
+    if not ch.ok:
+        print(ch.text[:300])
+        print("Похоже, id неверный или бот не добавлен в этот канал")
+        return
+    c = ch.json()
+    print(f"Канал: «{c.get('title')}», тип: {c.get('type')}")
+    mem = max_req("GET", f"/chats/{MAX_CHAT_ID}/members/me")
+    if mem.ok:
+        m = mem.json()
+        print(f"Бот администратор: {m.get('is_admin')}, права: {m.get('permissions')}")
+    else:
+        print(f"Не удалось проверить права бота: HTTP {mem.status_code} {mem.text[:200]}")
+
+
 def find_max_chat():
     """Показывает chat_id чатов и каналов из последних событий бота MAX."""
     r = max_req("GET", "/updates", params={"limit": 100, "timeout": 5})
@@ -592,6 +624,9 @@ def notify(p, ok):
 
 
 def main():
+    if os.environ.get("CHECK_MAX") == "1":
+        check_max_chat()
+        return
     if os.environ.get("FIND_MAX_CHAT") == "1":
         find_max_chat()
         return

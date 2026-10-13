@@ -370,8 +370,15 @@ def max_verify():
     global _max_verify
     if _max_verify is not None:
         return _max_verify
-    files = sorted(glob.glob("russian_trusted_*"))
+    files = sorted(
+        f for f in glob.glob("*")
+        if os.path.isfile(f)
+        and f.lower().replace(" ", "_").replace("-", "_").startswith("russian_trusted")
+    )
     if not files:
+        print("MAX: файлы сертификатов Минцифры не найдены в корне репозитория. "
+              "Скачайте корневой и выпускающий сертификаты с https://www.gosuslugi.ru/crt "
+              "и загрузите их рядом с crosspost.py (имя должно начинаться с Russian Trusted).")
         _max_verify = True
         return True
     import certifi
@@ -421,7 +428,12 @@ def check_max_chat():
     if not MAX_TOKEN:
         print("Не задан секрет MAX_TOKEN")
         return
-    me = max_req("GET", "/me")
+    try:
+        me = max_req("GET", "/me")
+    except requests.exceptions.SSLError:
+        print("MAX: ошибка проверки сертификата. Нужны сертификаты Минцифры в корне репозитория "
+              "(корневой и выпускающий), см. сообщение выше.")
+        sys.exit(1)
     print(f"MAX /me: HTTP {me.status_code}")
     if me.ok:
         b = me.json()

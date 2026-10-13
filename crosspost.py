@@ -7,6 +7,7 @@ Telegram держит неподтверждённые обновления до
 """
 import glob
 import html
+import mimetypes
 import os
 import re
 import ssl
@@ -357,8 +358,12 @@ def with_note(text, note, signature):
     return text + "\n\n" + note
 
 
+class Incomplete(Exception):
+    """Не все файлы удалось загрузить: пост на площадке не публикуется."""
+
+
 def post_vk(text, media, link=None):
-    """Публикует пост. Возвращает число файлов, которые не удалось загрузить."""
+    """Публикует пост целиком или не публикует совсем."""
     atts, failed = [], 0
     title = (text.strip().splitlines() or [""])[0]
     for item in media:
@@ -370,11 +375,10 @@ def post_vk(text, media, link=None):
         except Exception as e:  # noqa: BLE001
             failed += 1
             print(f"  VK: не удалось загрузить {item['kind']}: {e}")
-    if failed and ADD_TG_LINK and link:
-        text = with_note(text, f"Полная версия в Telegram: {link}", SIGNATURE_VK)
+    if failed:
+        raise Incomplete(f"не загрузились файлы ({failed} из {len(media)}), пост не опубликован")
     vk("wall.post", owner_id=-int(vk_group_id()), from_group=1,
        message=text, attachments=",".join(atts[:10]))
-    return failed
 
 
 # ───────────────────────────── MAX ─────────────────────────────
@@ -426,16 +430,41 @@ def max_req(method, path, **kw):
                             timeout=120, verify=max_verify(), **kw)
 
 
+def short_err(text):
+    """Достаёт суть из HTML-страницы ошибки."""
+    m = re.search(r"<b>(?:Message|Сообщение)</b>\s*(.*?)</p>", text, re.S | re.I)
+    if m:
+        return re.sub(r"<[^>]+>", "", m.group(1)).strip()[:300]
+    m = re.search(r"<title>(.*?)</title>", text, re.S | re.I)
+    plain = re.sub(r"<[^>]+>", " ", text)
+    plain = re.sub(r"\s+", " ", plain).strip()
+    return (m.group(1).strip() + " | " if m else "") + plain[-300:]
+
+
 def max_upload(path, kind):
     r = max_req("POST", "/uploads", params={"type": kind})
     r.raise_for_status()
     info = r.json()
+    name = os.path.basename(path)
+    if "." not in name:
+        name += ".mp4" if kind == "video" else ".jpg"
+    mime = mimetypes.guess_type(name)[0] or ("video/mp4" if kind == "video" else "image/jpeg")
     with open(path, "rb") as f:
-        # как в официальном клиенте MAX: multipart, поле data, без заголовка авторизации
-        up = requests.post(info["url"], files={"data": (os.path.basename(path), f)},
+        # как в библиотеках для MAX: multipart, поле data, с именем и типом файла
+        up = requests.post(info["url"], files={"data": (name, f, mime)},
                            timeout=900, verify=max_verify())
+    if not up.ok and kind == "video":
+        print(f"  MAX: обычная загрузка видео не прошла ({up.status_code}: {short_err(up.text)}), "
+              "пробую загрузку одним блоком")
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            up = requests.post(info["url"], data=f, timeout=900, verify=max_verify(), headers={
+                "Content-Type": "application/x-binary; charset=x-user-defined",
+                "Content-Disposition": f'attachment; filename="{name}"',
+                "Content-Range": f"bytes 0-{size - 1}/{size}",
+            })
     if not up.ok:
-        raise RuntimeError(f"загрузка файла: HTTP {up.status_code} {up.text[:300]}")
+        raise RuntimeError(f"загрузка файла: HTTP {up.status_code} {short_err(up.text)}")
     try:
         data = up.json()
     except ValueError:
@@ -520,7 +549,7 @@ def find_max_chat():
 
 
 def post_max(text_html, media, link=None):
-    """Публикует пост. Возвращает число файлов, которые не удалось загрузить."""
+    """Публикует пост целиком или не публикует совсем."""
     atts, failed = [], 0
     for m in media:
         try:
@@ -528,16 +557,15 @@ def post_max(text_html, media, link=None):
         except Exception as e:  # noqa: BLE001
             failed += 1
             print(f"  MAX: не удалось загрузить {m['kind']}: {e}")
-    if failed and ADD_TG_LINK and link:
-        note = html.escape(f"Полная версия в Telegram: {link}", quote=False)
-        text_html = with_note(text_html, note, SIGNATURE_MAX)
+    if failed:
+        raise Incomplete(f"не загрузились файлы ({failed} из {len(media)}), пост не опубликован")
     body = {"text": text_html, "format": "html"}
     if atts:
         body["attachments"] = atts
     for _ in range(36):  # видео обрабатывается дольше, ждём до ~3 минут
         r = max_req("POST", "/messages", params={"chat_id": MAX_CHAT_ID}, json=body)
         if r.ok:
-            return failed
+            return
         if "not.ready" in r.text:  # видео/картинка ещё обрабатываются
             time.sleep(5)
             continue
@@ -591,76 +619,69 @@ def compose_texts(text, entities, note, link):
 
 
 def process(p):
+    """Публикует пост. Возвращает {площадка: None если ок, иначе причина}."""
     link = post_link(p["chat"], p["message_id"])
-    ok = True
-    too_big = False
+    results = {}
+    platforms = []
+    if VK_TOKEN and VK_GROUP_ID:
+        platforms.append("VK")
+    if MAX_TOKEN and MAX_CHAT_ID:
+        platforms.append("MAX")
 
     with tempfile.TemporaryDirectory() as tmp:
-        media = []
+        media, too_big = [], 0
         for i, item in enumerate(p["media"]):
             if item["size"] and item["size"] > TG_LIMIT_BYTES:
-                too_big = True
+                too_big += 1
                 continue
             try:
                 item["path"] = download(item["file_id"], tmp, f"m{i}")
                 media.append(item)
             except Exception as e:  # noqa: BLE001
                 if "too big" in str(e).lower():
-                    too_big = True
+                    too_big += 1
                 else:
                     raise
 
-        note = ""
+        print(f"Пост {p['message_id']}: текст {len(p['text'])} симв., медиа {len(p['media'])}")
         if too_big:
-            print("  Видео больше 20 МБ: Telegram не отдаёт его боту, публикую без него")
-        if too_big and ADD_TG_LINK and link:
-            note = f"\n\nПолная версия с видео: {link}"
+            reason = (f"{too_big} видео больше 20 МБ, Telegram не отдаёт такие файлы боту. "
+                      "Пост не опубликован нигде")
+            print("  " + reason)
+            return {name: reason for name in platforms}
 
-        vk_text, max_html, empty = compose_texts(p["text"], p["entities"], note, link)
-
+        vk_text, max_html, empty = compose_texts(p["text"], p["entities"], "", link)
         if empty and not media:
             print("Пост без текста и медиа, пропускаю")
-            return True
-
-        print(f"Пост {p['message_id']}: текст {len(p['text'])} симв., медиа {len(media)}")
+            return {}
         if DRY_RUN:
             print("--- VK ---\n" + vk_text + "\n--- MAX ---\n" + max_html)
-            return True
+            return {}
 
-        if VK_TOKEN and VK_GROUP_ID:
+        senders = {"VK": lambda: post_vk(vk_text, media, link),
+                   "MAX": lambda: post_max(max_html, media, link)}
+        for name in platforms:
             try:
-                bad = post_vk(vk_text, media, link)
-                if bad:
-                    ok = False
-                    print(f"  VK: опубликовано без {bad} файл(ов), см. ошибку выше")
-                else:
-                    print("  VK: ок")
+                senders[name]()
+                results[name] = None
+                print(f"  {name}: ок, опубликовано целиком")
             except Exception as e:  # noqa: BLE001
-                ok = False
-                print(f"  VK: ОШИБКА {e}")
-        if MAX_TOKEN and MAX_CHAT_ID:
-            try:
-                bad = post_max(max_html, media, link)
-                if bad:
-                    ok = False
-                    print(f"  MAX: опубликовано без {bad} файл(ов), см. ошибку выше")
-                else:
-                    print("  MAX: ок")
-            except Exception as e:  # noqa: BLE001
-                ok = False
-                print(f"  MAX: ОШИБКА {e}")
-    return ok
+                results[name] = str(e)
+                print(f"  {name}: НЕ ОПУБЛИКОВАНО: {e}")
+    return results
 
 
-def notify(p, ok):
+def notify(p, results):
     """Отвечает админу в личку, если пост пришёл пересылкой."""
     if not p.get("reply_to") or DRY_RUN:
         return
-    text = (
-        "✅ Готово, пост опубликован."
-        if ok
-        else "⚠️ Пост опубликован не везде. Подробности в логе GitHub Actions."
-    )
+    if all(v is None for v in results.values()):
+        text = "✅ Готово, пост опубликован целиком: " + (", ".join(results) or "нет площадок")
+    else:
+        lines = ["⚠️ Пост опубликован не везде:"]
+        for name, err in results.items():
+            lines.append(f"{name}: " + ("✅ опубликован" if err is None else f"❌ {err[:200]}"))
+        text = "\n".join(lines)
     try:
         tg("sendMessage", chat_id=p["reply_to"], text=text)
     except Exception as e:  # noqa: BLE001
@@ -693,13 +714,13 @@ def main():
             confirm_to = p["first_update"] - 1
             break
         try:
-            ok = process(p)
+            results = process(p)
         except Exception as e:  # noqa: BLE001
-            ok = False
             print(f"Пост {p['message_id']}: ОШИБКА {e}")
-        if not ok:
+            results = {"Все площадки": f"ошибка: {e}"}
+        if any(v is not None for v in results.values()):
             failed = True
-        notify(p, ok)
+        notify(p, results)
 
     if not DRY_RUN:
         for chat_id in ADMIN_HINTS:

@@ -1,0 +1,61 @@
+name: Crosspost
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Тестовый прогон: показать, что было бы опубликовано, ничего не отправляя"
+        type: boolean
+        default: false
+      check_max:
+        description: "Проверить подключение к MAX (токен и id канала), ничего не публикуя"
+        type: boolean
+        default: false
+      find_max_chat:
+        description: "Найти chat_id канала MAX (НЕ включать, если бот общий с другим сервисом)"
+        type: boolean
+        default: false
+      vk_auth_url:
+        description: "Вход в VK: вставьте адрес страницы, на которую VK вернул после «Разрешить»"
+        type: string
+        default: ""
+
+concurrency:
+  group: crosspost
+  cancel-in-progress: false
+
+jobs:
+  crosspost:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - run: python crosspost.py
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHANNEL_ID: ${{ secrets.TG_CHANNEL_ID }}
+          TG_ADMIN_IDS: ${{ secrets.TG_ADMIN_IDS }}
+          VK_TOKEN: ${{ secrets.VK_TOKEN }}
+          VK_GROUP_ID: ${{ secrets.VK_GROUP_ID }}
+          VK_APP_ID: "54820911"
+          VK_REDIRECT_URI: "https://gangsterhamster15.github.io/vk-auth"
+          VK_REFRESH_TOKEN: ${{ secrets.VK_REFRESH_TOKEN }}
+          VK_DEVICE_ID: ${{ secrets.VK_DEVICE_ID }}
+          VK_CODE_VERIFIER: ${{ secrets.VK_CODE_VERIFIER }}
+          VK_AUTH_URL: ${{ inputs.vk_auth_url }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          MAX_TOKEN: ${{ secrets.MAX_TOKEN }}
+          MAX_CHAT_ID: ${{ secrets.MAX_CHAT_ID }}
+          STRIP_SCHEME: "1"  # "0" — не сокращать ссылки, оставлять https://
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+          CHECK_MAX: ${{ inputs.check_max && '1' || '0' }}
+          FIND_MAX_CHAT: ${{ inputs.find_max_chat && '1' || '0' }}

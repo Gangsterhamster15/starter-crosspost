@@ -39,6 +39,8 @@ ADMIN_IDS = {
     if x.strip().lstrip("-").isdigit()
 }
 ADMIN_HINTS = set()
+# Слова-команды тестового режима: пересланный следом пост бот только покажет в личке
+PREVIEW_WORDS = {"тест", "test", "проверка", "preview", "превью"}
 # Добавлять ли ссылку «Полная версия в Telegram», если какой-то файл не перенёсся
 ADD_TG_LINK = os.environ.get("ADD_TG_LINK") == "1"  # чаты админов, которым нужно ответить подсказкой
 
@@ -46,6 +48,7 @@ SETTLE_SECONDS = 90  # ждём, пока долетят все части ал�
 TG_LIMIT_BYTES = 20 * 1024 * 1024  # лимит скачивания файлов через Bot API
 MAX_TEXT_LIMIT = 4000
 VK_API_VERSION = "5.199"
+VK_MAX_ATTACHMENTS = 10
 
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 TG_FILE = f"https://api.telegram.org/file/bot{TG_TOKEN}"
@@ -73,12 +76,17 @@ def post_link(chat, message_id):
     return None
 
 
+PENDING_PREVIEW = []  # команды «тест», после которых пересылка ещё не пришла
+
+
 def collect_posts(updates):
     """Склеивает обновления в посты (альбом = один пост)."""
     posts, groups = [], {}
+    preview_cmd = {}  # чат админа -> update_id команды «тест», ждущей следующий пост
     for u in updates:
         m = u.get("channel_post")
         reply_to = None
+        preview_from = None
         if m:
             if TG_CHANNEL_ID and str(m["chat"]["id"]) != TG_CHANNEL_ID:
                 print("Пост другого канала, пропускаю (не совпадает TG_CHANNEL_ID)")
@@ -98,11 +106,16 @@ def collect_posts(updates):
                 continue
             origin = m.get("forward_origin")
             if not origin:
+                if (m.get("text") or "").strip().lower().strip("/!.") in PREVIEW_WORDS:
+                    print("Команда «тест»: следующий пересланный пост только покажу, без публикации")
+                    preview_cmd[m["chat"]["id"]] = (u["update_id"], m.get("date", 0))
+                    continue
                 print("Сообщение от админа пришло не как пересылка поста, пропускаю")
                 ADMIN_HINTS.add(m["chat"]["id"])
                 continue
             print(f"Получена пересылка от админа (сообщение {m['message_id']})")
             reply_to = m["chat"]["id"]
+            preview_from = (preview_cmd.get(reply_to) or (None,))[0]
             if origin.get("type") == "channel":
                 src_chat, src_msg_id = origin["chat"], origin["message_id"]
             else:
@@ -112,6 +125,8 @@ def collect_posts(updates):
         if key and key in groups:
             p = groups[key]
         else:
+            if preview_from is not None:
+                preview_cmd.pop(reply_to, None)  # «тест» действует на один пост
             p = {
                 "group": bool(gid),
                 "first_update": u["update_id"],
@@ -119,6 +134,7 @@ def collect_posts(updates):
                 "message_id": src_msg_id,
                 "chat": src_chat,
                 "reply_to": reply_to,
+                "preview_cmd": preview_from,
                 "text": "",
                 "entities": [],
                 "media": [],
@@ -128,7 +144,12 @@ def collect_posts(updates):
                 groups[key] = p
         p["last_date"] = max(p["last_date"], m.get("date", 0))
 
-        if m.get("text") and not p["text"]:
+        if m.get("rich_message") and not p["text"]:
+            # пост в формате статьи: блоки (абзацы, таблицы, фото...) -> текст + медиа
+            text, ents, rich_media = render_rich_message(m["rich_message"])
+            p["text"], p["entities"] = text, ents
+            p["media"].extend(rich_media)
+        elif m.get("text") and not p["text"]:
             p["text"], p["entities"] = m["text"], m.get("entities", [])
         elif m.get("caption") and not p["text"]:
             p["text"], p["entities"] = m["caption"], m.get("caption_entities", [])
@@ -142,7 +163,50 @@ def collect_posts(updates):
         elif m.get("animation"):
             v = m["animation"]
             p["media"].append({"kind": "video", "file_id": v["file_id"], "size": v.get("file_size", 0)})
+    # «тест» мог прийти сразу после пересылки (комментарий к пересылке): привязываем к ней
+    for chat_id, (uid, date) in list(preview_cmd.items()):
+        prev = [q for q in posts if q.get("reply_to") == chat_id and q["first_update"] < uid
+                and q.get("preview_cmd") is None and 0 <= date - q["last_date"] <= 10]
+        if prev:
+            prev[-1]["preview_cmd"] = uid
+            del preview_cmd[chat_id]
+    PENDING_PREVIEW[:] = list(preview_cmd.values())
     return posts
+
+
+def send_preview(p):
+    """Тестовый режим: показывает админу в личке, как пост выйдет в VK и MAX."""
+    link = post_link(p["chat"], p["message_id"])
+    vk_text, max_html, _ = compose_texts(p["text"], p["entities"], "", link)
+    photos = sum(1 for m in p["media"] if m["kind"] == "photo")
+    videos = len(p["media"]) - photos
+    head = [f"🔎 Тест: пост не опубликован.\nВложения: фото {photos}, видео {videos}."]
+    if len(p["media"]) > VK_MAX_ATTACHMENTS:
+        head.append(f"⚠️ В VK такой пост не выйдет: больше {VK_MAX_ATTACHMENTS} вложений.")
+    big = [m for m in p["media"] if m.get("size", 0) > TG_LIMIT_BYTES]
+    if big:
+        head.append(f"⚠️ Не выйдет нигде: {len(big)} видео больше 20 МБ.")
+    if len(max_html) > MAX_TEXT_LIMIT:
+        head.append("⚠️ Текст длиннее лимита MAX, там он будет обрезан.")
+    chat = p["reply_to"]
+
+    def send(text, html_mode=False):
+        for i in range(0, len(text), 4000):  # лимит сообщения Telegram
+            chunk = text[i:i + 4000]
+            try:
+                if html_mode:
+                    tg("sendMessage", chat_id=chat, text=chunk, parse_mode="HTML",
+                       link_preview_options={"is_disabled": True})
+                else:
+                    tg("sendMessage", chat_id=chat, text=chunk,
+                       link_preview_options={"is_disabled": True})
+            except Exception:  # noqa: BLE001  (например, HTML разрезался посередине тега)
+                tg("sendMessage", chat_id=chat, text=chunk)
+
+    send("\n".join(head))
+    send("— VK —\n\n" + vk_text)
+    send("— MAX —\n\n" + max_html, html_mode=True)
+    print(f"Пост {p['message_id']}: отправлен предпросмотр в личку")
 
 
 def download(file_id, folder, name):
@@ -290,6 +354,216 @@ def to_html(text, entities):
     close_until(len(b))
     out.append(seg(pos, len(b)))
     return "".join(out)
+
+
+# ───────────────── Статьи Telegram (rich_message) ─────────────────
+# В VK и MAX нет таблиц, заголовков и блоков статей, поэтому статья
+# превращается в обычный текст с разметкой Telegram (entities), а таблицы —
+# в понятные списки. Дальше такой текст идёт тем же путём, что и обычный пост.
+
+RICH_STYLE = {"bold": "bold", "italic": "italic", "underline": "underline",
+              "strikethrough": "strikethrough", "code": "code"}
+
+
+class RichBuilder:
+    def __init__(self):
+        self.parts, self.size, self.entities, self.media = [], 0, [], []
+
+    def add(self, s):
+        if s:
+            self.parts.append(s)
+            self.size += len(s.encode("utf-16-le")) // 2
+
+    def styled(self, etype, fn, **extra):
+        start = self.size
+        fn()
+        if self.size > start:
+            self.entities.append(dict(type=etype, offset=start, length=self.size - start, **extra))
+
+    def text(self):
+        return "".join(self.parts)
+
+    def merge(self, other, sep=""):
+        """Дописывает текст другого построителя (с разметкой и медиа)."""
+        self.media.extend(other.media)
+        if not other.parts:
+            return
+        self.add(sep)
+        shift = self.size
+        self.parts.extend(other.parts)
+        self.size += other.size
+        for e in other.entities:
+            self.entities.append(dict(e, offset=e["offset"] + shift))
+
+
+def rich_plain(rt):
+    """RichText -> обычная строка без разметки."""
+    b = RichBuilder()
+    rich_text(b, rt)
+    return b.text().strip()
+
+
+def rich_text(b, rt):
+    if rt is None:
+        return
+    if isinstance(rt, str):
+        b.add(rt)
+        return
+    if isinstance(rt, list):
+        for part in rt:
+            rich_text(b, part)
+        return
+    if not isinstance(rt, dict):
+        return
+    t = rt.get("type")
+    inner = rt.get("text")
+    if inner is None:  # редкие типы без поля text: берём любую строку
+        inner = next((v for k, v in rt.items() if k != "type" and isinstance(v, str)), "")
+    if t in RICH_STYLE:
+        b.styled(RICH_STYLE[t], lambda: rich_text(b, inner))
+    elif t == "url" and rt.get("url"):
+        b.styled("text_link", lambda: rich_text(b, inner), url=rt["url"])
+    else:
+        rich_text(b, inner)
+
+
+def rich_media_item(block):
+    t = block.get("type")
+    if t == "photo" and block.get("photo"):
+        best = block["photo"][-1]
+        return {"kind": "photo", "file_id": best["file_id"], "size": best.get("file_size", 0)}
+    if t in ("video", "animation"):
+        v = block.get(t) or {}
+        if v.get("file_id"):
+            return {"kind": "video", "file_id": v["file_id"], "size": v.get("file_size", 0)}
+    return None
+
+
+def rich_table(b, table):
+    """Таблица -> список без маркеров, строки таблицы разделены пустой строкой.
+
+    С заголовком и 2 столбцами:   Базовый — 990 ₽
+    С заголовком и 3+ столбцами:  Базовый
+                                  Цена: 990 ₽
+                                  Срок: 1 месяц
+    Без заголовка:                Базовый — 990 ₽ — 1 месяц
+    """
+    rows = [[c for c in row if c.get("text") is not None] for row in table.get("cells") or []]
+    rows = [r for r in rows if any(rich_plain(c.get("text")) for c in r)]
+    if not rows:
+        return
+    if table.get("caption"):
+        b.styled("bold", lambda: rich_text(b, table["caption"]))
+        b.add("\n\n")
+    header = None
+    if len(rows) > 1 and all(c.get("is_header") for c in rows[0]):
+        header = [rich_plain(c.get("text")) for c in rows[0]]
+        rows = rows[1:]
+    wrote = False
+    for row in rows:
+        cells = [c for c in row if rich_plain(c.get("text"))]
+        if not cells:
+            continue
+        if wrote:
+            b.add("\n\n")  # пустая строка между строками таблицы
+        wrote = True
+        if header and len(row) >= 3:
+            b.styled("bold", lambda: rich_text(b, cells[0].get("text")))
+            for j, cell in enumerate(row[1:], start=1):
+                value = rich_plain(cell.get("text"))
+                if not value:
+                    continue
+                b.add("\n")
+                label = header[j] if j < len(header) else ""
+                if label:
+                    b.add(f"{label}: ")
+                rich_text(b, cell.get("text"))
+        else:
+            for j, cell in enumerate(cells):
+                if j:
+                    b.add(" — ")
+                rich_text(b, cell.get("text"))
+
+
+def rich_blocks(b, blocks, indent=""):
+    """Блоки через пустую строку (во вложенных списках — через перенос)."""
+    sep = "\n" if indent else "\n\n"
+    wrote = False
+    for block in blocks or []:
+        part = RichBuilder()
+        rich_block(part, block, indent)
+        b.merge(part, sep if wrote and part.parts else "")
+        wrote = wrote or bool(part.parts)
+
+
+def rich_block(b, block, indent=""):
+    t = block.get("type")
+    media = rich_media_item(block)
+    if media:
+        b.media.append(media)
+        cap = block.get("caption") or {}
+        if cap.get("text"):
+            b.styled("italic", lambda: rich_text(b, cap["text"]))
+        return
+    if t == "paragraph":
+        rich_text(b, block.get("text"))
+    elif t == "heading":
+        b.styled("bold", lambda: rich_text(b, block.get("text")))
+    elif t == "pre":
+        b.styled("pre", lambda: rich_text(b, block.get("text")))
+    elif t == "footer":
+        b.styled("italic", lambda: rich_text(b, block.get("text")))
+    elif t == "divider":
+        b.add("———")
+    elif t == "list":
+        for i, item in enumerate(block.get("items") or []):
+            if i:
+                b.add("\n")
+            label = item.get("label") or "•"
+            if item.get("has_checkbox"):
+                label = "☑" if item.get("is_checked") else "☐"
+            b.add(f"{indent}{label} ")
+            rich_blocks(b, item.get("blocks"), indent + "   ")
+    elif t in ("blockquote", "pull_quote", "pullquote", "expandable_blockquote"):
+        b.styled("italic", lambda: rich_blocks(b, block.get("blocks"), indent)
+                 if block.get("blocks") else rich_text(b, block.get("text")))
+        if block.get("credit"):
+            b.add("\n— ")
+            rich_text(b, block["credit"])
+    elif t == "details":
+        b.styled("bold", lambda: rich_text(b, block.get("summary")))
+        b.add("\n")
+        rich_blocks(b, block.get("blocks"), indent)
+    elif t == "table":
+        rich_table(b, block)
+    elif t in ("collage", "slideshow"):
+        for inner in block.get("blocks") or []:
+            rich_block(b, inner, indent)
+        cap = block.get("caption") or {}
+        if cap.get("text"):
+            b.styled("italic", lambda: rich_text(b, cap["text"]))
+    elif block.get("blocks"):
+        rich_blocks(b, block["blocks"], indent)
+    elif block.get("text") is not None:
+        rich_text(b, block.get("text"))
+    # остальное (карты, аудио, кнопки и т.п.) в VK и MAX не переносится
+
+
+def render_rich_message(rm):
+    b = RichBuilder()
+    rich_blocks(b, rm.get("blocks"))
+    text = b.text().strip("\n")
+    n = len(text.encode("utf-16-le")) // 2
+    ents, seen = [], set()
+    for e in b.entities:
+        if e["offset"] >= n:
+            continue
+        e["length"] = min(e["length"], n - e["offset"])
+        key = (e["type"], e["offset"], e["length"])
+        if key not in seen:  # одинаковое выделение дважды (жирный в жирном) не нужно
+            seen.add(key)
+            ents.append(e)
+    return text, ents, b.media
 
 
 def to_vk_text(text, entities):
@@ -468,8 +742,11 @@ class Incomplete(Exception):
 
 def post_vk(text, media, link=None):
     """Публикует пост целиком или не публикует совсем."""
+    if len(media) > VK_MAX_ATTACHMENTS:
+        raise Incomplete(f"в посте {len(media)} фото/видео, а VK принимает не больше "
+                         f"{VK_MAX_ATTACHMENTS}. Пост не опубликован")
     atts, failed = [], 0
-    title = (text.strip().splitlines() or [""])[0]
+    title =(text.strip().splitlines() or [""])[0]
     for item in media:
         try:
             if item["kind"] == "photo":
@@ -482,7 +759,7 @@ def post_vk(text, media, link=None):
     if failed:
         raise Incomplete(f"не загрузились файлы ({failed} из {len(media)}), пост не опубликован")
     vk("wall.post", owner_id=-int(vk_group_id()), from_group=1,
-       message=text, attachments=",".join(atts[:10]))
+       message=text, attachments=",".join(atts))
 
 
 # ───────────────────────────── MAX ─────────────────────────────
@@ -815,11 +1092,28 @@ def main():
     confirm_to = updates[-1]["update_id"]
     failed = False
 
+    # «тест» пришёл, а пересылка за ним ещё нет: подождём её, чтобы случайно не опубликовать
+    hold = [uid for uid, date in PENDING_PREVIEW if time.time() - date < SETTLE_SECONDS]
+    if hold:
+        confirm_to = min(hold) - 1
+        print("Жду пересылку после команды «тест», вернусь на следующем запуске")
+
     for p in posts:
+        if hold and p["first_update"] > min(hold):
+            break
         if p["group"] and time.time() - p["last_date"] < SETTLE_SECONDS:
             print("Альбом ещё догружается, вернёмся к нему на следующем запуске")
-            confirm_to = p["first_update"] - 1
+            confirm_to = min(confirm_to, p["first_update"] - 1)
+            if p.get("preview_cmd") is not None:
+                confirm_to = min(confirm_to, p["preview_cmd"] - 1)  # «тест» сохраняем вместе с альбомом
             break
+        if p.get("preview_cmd") is not None:
+            try:
+                if not DRY_RUN:
+                    send_preview(p)
+            except Exception as e:  # noqa: BLE001
+                print(f"Не удалось отправить предпросмотр: {e}")
+            continue
         try:
             results = process(p)
         except Exception as e:  # noqa: BLE001

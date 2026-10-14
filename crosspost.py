@@ -361,6 +361,36 @@ def to_html(text, entities):
 # превращается в обычный текст с разметкой Telegram (entities), а таблицы —
 # в понятные списки. Дальше такой текст идёт тем же путём, что и обычный пост.
 
+# Чем заменять кастомные эмодзи Telegram в VK и MAX (номер эмодзи -> обычный эмодзи).
+# Остальные кастомные эмодзи заменяются эмодзи, который предлагает сам Telegram.
+CUSTOM_EMOJI_MAP = {
+    "5289864378122806873": "💬",  # значок перед автором цитаты
+}
+
+
+def replace_custom_emoji(text, entities):
+    """В обычных постах: подставляет эмодзи из CUSTOM_EMOJI_MAP вместо кастомных."""
+    targets = sorted(
+        (e for e in entities or [] if e.get("type") == "custom_emoji"
+         and str(e.get("custom_emoji_id")) in CUSTOM_EMOJI_MAP),
+        key=lambda e: e["offset"], reverse=True)
+    if not targets:
+        return text, entities
+    b = text.encode("utf-16-le")
+    ents = [dict(e) for e in entities]
+    for t in targets:
+        new = CUSTOM_EMOJI_MAP[str(t["custom_emoji_id"])].encode("utf-16-le")
+        s, z = t["offset"] * 2, (t["offset"] + t["length"]) * 2
+        delta = len(new) // 2 - t["length"]
+        b = b[:s] + new + b[z:]
+        for e in ents:  # сдвигаем выделения, которые идут после или включают замену
+            if e["offset"] >= t["offset"] + t["length"]:
+                e["offset"] += delta
+            elif e["offset"] <= t["offset"] and e["offset"] + e["length"] >= t["offset"] + t["length"]:
+                e["length"] += delta
+    return b.decode("utf-16-le"), ents
+
+
 RICH_STYLE = {"bold": "bold", "italic": "italic", "underline": "underline",
               "strikethrough": "strikethrough", "code": "code"}
 
@@ -417,8 +447,11 @@ def rich_text(b, rt):
         return
     t = rt.get("type")
     inner = rt.get("text")
-    if inner is None:  # редкие типы без поля text: берём любую строку
-        inner = next((v for k, v in rt.items() if k != "type" and isinstance(v, str)), "")
+    if t == "custom_emoji":  # вместо внутреннего номера эмодзи — обычный эмодзи-заменитель
+        inner = CUSTOM_EMOJI_MAP.get(str(rt.get("custom_emoji_id")), rt.get("alternative_text") or "")
+    if inner is None:  # редкие типы без поля text: берём подходящую строку, но не id
+        inner = next((v for k, v in rt.items() if k != "type" and not k.endswith("id")
+                      and isinstance(v, str)), "")
     if t in RICH_STYLE:
         b.styled(RICH_STYLE[t], lambda: rich_text(b, inner))
     elif t == "url" and rt.get("url"):
@@ -581,7 +614,7 @@ def to_vk_text(text, entities):
         if strip_scheme(label).rstrip("/") == strip_scheme(url).rstrip("/"):
             rep = label
         else:
-            rep = f"{label} ({strip_scheme(url)})"
+            rep = f"{label} ({strip_scheme(url).rstrip('/')})"
         b = b[:s] + rep.encode("utf-16-le") + b[z:]
     return _dec(b)
 
@@ -978,12 +1011,69 @@ def strip_signature(text, entities):
     return new_text, new_ents
 
 
+SPACE_RE = re.compile(r"[ \t ​⁠﻿]+(?=\n|$)|\r")
+
+
+def clean_spacing(text, entities):
+    """Убирает лишние пустые строки (оставляет не больше одной подряд)
+    и пробелы в конце строк. Смещения выделений пересчитываются."""
+    drop = [False] * len(text)
+    for m in SPACE_RE.finditer(text):  # пробелы перед переносом и в конце текста
+        for i in range(m.start(), m.end()):
+            drop[i] = True
+    newlines = 0
+    started = False
+    for i, ch in enumerate(text):
+        if drop[i]:
+            continue
+        if ch == "\n":
+            if not started:  # переносы в самом начале
+                drop[i] = True
+                continue
+            newlines += 1
+            if newlines > 2:  # третий и дальше перенос подряд = лишняя пустая строка
+                drop[i] = True
+        else:
+            newlines = 0
+            started = True
+    for i in range(len(text) - 1, -1, -1):  # переносы в самом конце
+        if drop[i]:
+            continue
+        if text[i] == "\n":
+            drop[i] = True
+        else:
+            break
+    if not any(drop):
+        return text, entities
+
+    # карта смещений в единицах UTF-16 (в них Telegram считает offset)
+    pos_map, new_pos, out = [], 0, []
+    for i, ch in enumerate(text):
+        units = len(ch.encode("utf-16-le")) // 2
+        for _ in range(units):
+            pos_map.append(new_pos)
+        if not drop[i]:
+            out.append(ch)
+            new_pos += units
+    pos_map.append(new_pos)
+
+    new_ents = []
+    for e in entities or []:
+        start = pos_map[min(e["offset"], len(pos_map) - 1)]
+        end = pos_map[min(e["offset"] + e["length"], len(pos_map) - 1)]
+        if end > start:
+            new_ents.append(dict(e, offset=start, length=end - start))
+    return "".join(out), new_ents
+
+
 def join_signature(body, signature):
     return body.rstrip() + "\n\n" + signature if body.strip() else signature
 
 
 def compose_texts(text, entities, note, link):
     """Возвращает (текст для VK, HTML для MAX, пуст ли пост без подписи)."""
+    text, entities = replace_custom_emoji(text, entities)
+    text, entities = clean_spacing(text, entities)
     text, entities = strip_signature(text, entities)
     norm_text, norm_ents = normalize_links(text, entities)
     body_vk = to_vk_text(norm_text, norm_ents) + note

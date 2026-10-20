@@ -1078,6 +1078,18 @@ def clean_spacing(text, entities):
     return "".join(out), new_ents
 
 
+# UTM-метки: ссылки с utm_source=tg в VK и MAX получают свою метку источника.
+# Остальные параметры (utm_medium, utm_campaign...) не меняются.
+UTM_FROM = ("tg", "telegram")
+UTM_SOURCE_VK = "vk"
+UTM_SOURCE_MAX = "max"
+UTM_RE = re.compile(r"(?i)(utm_source=)(" + "|".join(UTM_FROM) + r")(?=$|[&#\s\"'<>)\]])")
+
+
+def retag_utm(text, source):
+    return UTM_RE.sub(lambda m: m.group(1) + source, text)
+
+
 def join_signature(body, signature):
     return body.rstrip() + "\n\n" + signature if body.strip() else signature
 
@@ -1098,7 +1110,9 @@ def compose_texts(text, entities, note, link):
         tail = f"\n…\nПродолжение: {link}" if link else "…"
         body_max = cut + html.escape(tail, quote=False)
 
-    return join_signature(body_vk, SIGNATURE_VK), join_signature(body_max, SIGNATURE_MAX), empty
+    return (retag_utm(join_signature(body_vk, SIGNATURE_VK), UTM_SOURCE_VK),
+            retag_utm(join_signature(body_max, SIGNATURE_MAX), UTM_SOURCE_MAX),
+            empty)
 
 
 def process(p):

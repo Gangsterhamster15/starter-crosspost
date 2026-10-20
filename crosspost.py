@@ -704,9 +704,6 @@ def vk_auth(url):
     })
     print(f"VK ID: вход выполнен, пользователь {d.get('user_id')}")
     print(f"Выданные доступы: {d.get('scope')}")
-    save_secret("VK_REFRESH_TOKEN", d["refresh_token"])
-    save_secret("VK_DEVICE_ID", device_id)
-    print("Секреты VK_REFRESH_TOKEN и VK_DEVICE_ID сохранены.")
     global _vk_user_token
     _vk_user_token = d["access_token"]
     try:
@@ -715,6 +712,16 @@ def vk_auth(url):
         print(f"Сообщество: «{g[0].get('name')}», вы администратор: {bool(g[0].get('is_admin'))}")
     except Exception as e:  # noqa: BLE001
         print(f"Не удалось проверить сообщество: {e}")
+    # проверяем на деле, что токен умеет загружать фото на стену сообщества (ничего не публикует)
+    try:
+        vk("photos.getWallUploadServer", group_id=vk_group_id())
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"Проверка не пройдена: токен не может загружать фото в сообщество ({e}). "
+                 "Секреты НЕ сохранены, VK продолжит работать с ключом сообщества.")
+    print("Проверка пройдена: токен может загружать фото в сообщество.")
+    save_secret("VK_REFRESH_TOKEN", d["refresh_token"])
+    save_secret("VK_DEVICE_ID", device_id)
+    print("Секреты VK_REFRESH_TOKEN и VK_DEVICE_ID сохранены. Теперь VK публикует с фото и видео.")
 
 
 def vk(method, **params):

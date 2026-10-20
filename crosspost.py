@@ -660,10 +660,10 @@ def vk_id_request(data):
 def vk_token():
     """Токен для VK API: токен пользователя через VK ID, если он настроен, иначе ключ сообщества."""
     global _vk_user_token
+    if _vk_user_token:  # уже получен в этом запуске (в том числе сразу после входа)
+        return _vk_user_token
     if not VK_REFRESH_TOKEN:
         return VK_TOKEN
-    if _vk_user_token:
-        return _vk_user_token
     d = vk_id_request({
         "grant_type": "refresh_token",
         "refresh_token": VK_REFRESH_TOKEN,

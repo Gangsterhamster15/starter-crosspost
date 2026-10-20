@@ -798,8 +798,10 @@ def post_vk(text, media, link=None):
             print(f"  VK: не удалось загрузить {item['kind']}: {e}")
     if failed:
         raise Incomplete(f"не загрузились файлы ({failed} из {len(media)}), пост не опубликован")
-    vk("wall.post", owner_id=-int(vk_group_id()), from_group=1,
-       message=text, attachments=",".join(atts))
+    res = vk("wall.post", owner_id=-int(vk_group_id()), from_group=1,
+             message=text, attachments=",".join(atts))
+    post_id = res.get("post_id") if isinstance(res, dict) else None
+    return f"https://vk.com/wall-{vk_group_id()}_{post_id}" if post_id else None
 
 
 # ───────────────────────────── MAX ─────────────────────────────
@@ -986,7 +988,10 @@ def post_max(text_html, media, link=None):
     for _ in range(36):  # видео обрабатывается дольше, ждём до ~3 минут
         r = max_req("POST", "/messages", params={"chat_id": MAX_CHAT_ID}, json=body)
         if r.ok:
-            return
+            try:  # ссылка на опубликованное сообщение, если MAX её вернул
+                return (r.json().get("message") or {}).get("url")
+            except Exception:  # noqa: BLE001
+                return None
         if "not.ready" in r.text:  # видео/картинка ещё обрабатываются
             time.sleep(5)
             continue
@@ -1140,7 +1145,8 @@ def process(p):
                    "MAX": lambda: post_max(max_html, media, link)}
         for name in platforms:
             try:
-                senders[name]()
+                url = senders[name]()
+                p.setdefault("links", {})[name] = url
                 results[name] = None
                 print(f"  {name}: ок, опубликовано целиком")
             except Exception as e:  # noqa: BLE001
@@ -1149,21 +1155,42 @@ def process(p):
     return results
 
 
+def post_title(p, limit=80):
+    """Первая строка поста — чтобы в отчёте было понятно, о каком посте речь."""
+    line = next((l.strip() for l in (p.get("text") or "").splitlines() if l.strip()), "")
+    if not line:
+        return "пост без текста"
+    return "«" + (line if len(line) <= limit else line[:limit - 1].rstrip() + "…") + "»"
+
+
 def notify(p, results):
-    """Отвечает админу в личку, если пост пришёл пересылкой."""
-    if not p.get("reply_to") or DRY_RUN:
+    """Отчёт в личку после каждой публикации.
+
+    Пересланные посты — тому, кто переслал; посты из канала — всем из TG_ADMIN_IDS.
+    """
+    if DRY_RUN or not results:
         return
-    if all(v is None for v in results.values()):
-        text = "✅ Готово, пост опубликован целиком: " + (", ".join(results) or "нет площадок")
-    else:
-        lines = ["⚠️ Пост опубликован не везде:"]
-        for name, err in results.items():
-            lines.append(f"{name}: " + ("✅ опубликован" if err is None else f"❌ {err[:200]}"))
-        text = "\n".join(lines)
-    try:
-        tg("sendMessage", chat_id=p["reply_to"], text=text)
-    except Exception as e:  # noqa: BLE001
-        print(f"Не удалось ответить в личку: {e}")
+    recipients = [p["reply_to"]] if p.get("reply_to") else sorted(ADMIN_IDS)
+    if not recipients:
+        return
+    ok = all(v is None for v in results.values())
+    lines = ["✅ Пост опубликован" if ok else "⚠️ Пост опубликован не везде", post_title(p)]
+    tg_link = post_link(p.get("chat"), p.get("message_id"))
+    if tg_link:
+        lines.append(f"Telegram: {tg_link}")
+    links = p.get("links") or {}
+    for name, err in results.items():
+        if err is None:
+            lines.append(f"{name}: ✅ " + (links.get(name) or "опубликован"))
+        else:
+            lines.append(f"{name}: ❌ {err[:200]}")
+    text = "\n".join(lines)
+    for chat_id in recipients:
+        try:
+            tg("sendMessage", chat_id=chat_id, text=text,
+               link_preview_options={"is_disabled": True})
+        except Exception as e:  # noqa: BLE001
+            print(f"Не удалось отправить отчёт в личку {chat_id}: {e}")
 
 
 def main():
